@@ -422,3 +422,590 @@ This memory persists and is included in future Manager prompts, allowing multi-s
   ```
 
 ---
+
+## Scripter Delegation Pipeline
+
+**When:** Manager detects `<script>` tags in its plan (only in Reasoning Mode)
+
+**Purpose:** Execute off-device Python operations like API calls, web requests, data processing, file downloads, and webhooks on the host machine.
+
+### Pipeline Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        ManagerAgent                             │
+│                                                                 │
+│  Detects need for off-device operation and includes in plan:   │
+│                                                                 │
+│  <plan>                                                         │
+│  <script>                                                       │
+│  Fetch weather data from https://api.weather.com/london        │
+│  and extract the temperature in Celsius                        │
+│  </script>                                                      │
+│  1. Continue with device actions...                            │
+│  </plan>                                                        │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ ManagerPlanEvent (contains script)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      DroidAgent Router                          │
+│                                                                 │
+│  Detects <script> tag at start of plan                         │
+│  → Routes to ScripterAgent                                     │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ ScripterExecutorInputEvent(script_task)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      ScripterAgent                              │
+│                   (Off-device Python Executor)                  │
+│                                                                 │
+│  Execution Model: Like Jupyter Notebook                        │
+│  - Variables persist across executions                         │
+│  - Iterative problem solving                                   │
+│  - Max steps limit                                             │
+│                                                                 │
+│  Step 1: Generate Python code                                  │
+│  ```python                                                      │
+│  import requests                                               │
+│  response = requests.get("https://api.weather.com/london")     │
+│  data = response.json()                                        │
+│  temp = data['temperature']                                    │
+│  print(f"Temperature: {temp}°C")                               │
+│  ```                                                            │
+│                                                                 │
+│  Step 2: Execute code                                          │
+│  Output: "Temperature: 22°C"                                   │
+│                                                                 │
+│  Step 3: Final message (NO code block)                         │
+│  "Successfully fetched weather data. Temperature is 22°C"      │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ ScripterExecutorResultEvent
+                 │ (status=SUCCESS/FAILED, message)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        DroidAgent                               │
+│                                                                 │
+│  Wraps result in XML format for Manager:                       │
+│  <script_result status="SUCCESS">                              │
+│  Successfully fetched weather data. Temperature is 22°C        │
+│  </script_result>                                              │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ ManagerInputEvent (with script result)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        ManagerAgent                             │
+│                                                                 │
+│  Receives script result and continues planning:                │
+│                                                                 │
+│  <thought>                                                      │
+│  Great! I got the temperature (22°C). Now I need to            │
+│  display it on the device screen.                              │
+│  </thought>                                                     │
+│                                                                 │
+│  <add_memory>                                                   │
+│  At step 5, scripter successfully fetched weather: 22°C        │
+│  </add_memory>                                                  │
+│                                                                 │
+│  <plan>                                                         │
+│  1. Open Notes app                                             │
+│  2. Type "Today's temperature: 22°C"                           │
+│  3. DONE                                                        │
+│  </plan>                                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+| Agent | Prompt | Purpose |
+|-------|--------|---------|
+| **ScripterAgent** | `scripter/system.jinja2` | System prompt: Execute Python code iteratively like Jupyter |
+
+### Data Flow
+
+**Input to ScripterAgent:**
+- `task`: Description of what needs to be accomplished (from `<script>` tag)
+- `available_libraries`: List of Python libraries (requests, json, etc.)
+- `max_steps`: Maximum execution steps allowed
+
+**ScripterAgent iterative execution:**
+
+**Iteration 1:**
+```
+Thought: I need to fetch data from the API first.
+```python
+import requests
+response = requests.get("https://api.weather.com/london")
+data = response.json()
+print(f"Fetched: {data}")
+```
+
+**Iteration 2:**
+```
+Thought: Now extract the temperature.
+```python
+temperature = data['main']['temp']
+print(f"Temperature: {temperature}°C")
+```
+
+**Final iteration (NO CODE BLOCK):**
+```
+Successfully fetched weather data. The temperature in London is 22°C.
+```
+
+**Output from ScripterAgent:**
+- `status`: "SUCCESS" or "FAILED"
+- `message`: Final message explaining what happened
+
+### Error Handling
+
+If scripter encounters errors:
+
+```
+ScripterAgent Step 1:
+```python
+import requests
+response = requests.get("https://invalid-url.com")
+```
+
+Output: Connection error
+
+ScripterAgent Final Message (NO CODE BLOCK):
+"Error: Connection timeout. The API at https://invalid-url.com might be down. Please verify the URL."
+```
+
+Manager receives:
+```xml
+<script_result status="FAILED">
+Error: Connection timeout. The API at https://invalid-url.com might be down. Please verify the URL.
+</script_result>
+```
+
+Manager response:
+```xml
+<thought>
+The scripter failed due to connection timeout. I should try an alternative approach or inform the user.
+</thought>
+
+<request_accomplished success="false">
+Unable to fetch weather data due to API connection timeout.
+</request_accomplished>
+```
+
+### Example Flow
+
+**User Request:** "Download the latest release info from GitHub API and save it to clipboard"
+
+**Manager generates:**
+```xml
+<plan>
+<script>
+Fetch the latest release from GitHub API https://api.github.com/repos/owner/repo/releases/latest and extract the tag_name and published_at fields
+</script>
+1. Open any app with a text field
+2. Paste the release info into the text field
+3. Copy to clipboard
+4. DONE
+</plan>
+```
+
+**Scripter Execution:**
+
+**Step 1:**
+```python
+import requests
+url = "https://api.github.com/repos/owner/repo/releases/latest"
+response = requests.get(url)
+data = response.json()
+print(f"Status: {response.status_code}")
+```
+Output: `Status: 200`
+
+**Step 2:**
+```python
+tag = data['tag_name']
+published = data['published_at']
+release_info = f"Latest Release: {tag}\nPublished: {published}"
+print(release_info)
+```
+Output:
+```
+Latest Release: v1.2.3
+Published: 2024-01-15T10:30:00Z
+```
+
+**Final (NO CODE BLOCK):**
+```
+Successfully fetched latest release info:
+Latest Release: v1.2.3
+Published: 2024-01-15T10:30:00Z
+```
+
+**Manager receives result and continues with device actions to save to clipboard.**
+
+---
+
+## Text Manipulation Pipeline
+
+**When:** Manager detects `TEXT_TASK:` prefix in plan (only in Reasoning Mode)
+
+**Purpose:** Edit or transform text in currently focused Android text input fields using constrained Python code generation.
+
+### Pipeline Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        ManagerAgent                             │
+│                                                                 │
+│  Detects need for text manipulation in focused text field:     │
+│                                                                 │
+│  <plan>                                                         │
+│  1. Click on the message text field                            │
+│  TEXT_TASK: Add "Hello World" at the beginning of the text     │
+│  2. Send the message                                           │
+│  3. DONE                                                        │
+│  </plan>                                                        │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ ManagerPlanEvent (contains TEXT_TASK)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      DroidAgent Router                          │
+│                                                                 │
+│  Detects TEXT_TASK: prefix in first subgoal                    │
+│  → Routes to TextManipulatorAgent                              │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ TextManipulatorInputEvent(task, current_text)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   TextManipulatorAgent                          │
+│              (Constrained Code Generator)                       │
+│                                                                 │
+│  Input:                                                         │
+│  - Task: "Add 'Hello World' at the beginning"                  │
+│  - ORIGINAL: "This is existing text"                           │
+│  - Overall plan context                                        │
+│  - Current subgoal                                             │
+│                                                                 │
+│  LLM generates constrained Python code:                        │
+│  ```python                                                      │
+│  new_text = "Hello World\n" + ORIGINAL                         │
+│  input_text(new_text)                                          │
+│  ```                                                            │
+│                                                                 │
+│  Sandbox Execution:                                            │
+│  - Environment: {                                              │
+│      "__builtins__": {},                                       │
+│      "input_text": <function>,                                 │
+│      "ORIGINAL": "This is existing text"                       │
+│    }                                                            │
+│  - Executes code safely                                        │
+│  - Captures result from input_text() call                      │
+│                                                                 │
+│  If execution fails:                                           │
+│  → Send error back to LLM for correction                       │
+│  → Retry (up to 4 times)                                       │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ TextManipulatorResultEvent
+                 │ (text_to_type, code_ran)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        DroidAgent                               │
+│                                                                 │
+│  1. Receives final text: "Hello World\nThis is existing text"  │
+│  2. Executes input_text() to clear field and type new text     │
+│  3. Records outcome                                            │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ ManagerInputEvent (with result)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        ManagerAgent                             │
+│                                                                 │
+│  Receives confirmation and continues:                           │
+│                                                                 │
+│  <thought>                                                      │
+│  Text has been modified successfully. Now send the message.    │
+│  </thought>                                                     │
+│                                                                 │
+│  <plan>                                                         │
+│  1. Send the message                                           │
+│  2. DONE                                                        │
+│  </plan>                                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+| Component | Prompt | Purpose |
+|-----------|--------|---------|
+| **TextManipulator** | Inline system prompt | Constrained Python code generator for text editing |
+| **TextManipulator** | Error correction prompt | Fixes code execution errors |
+| **TextManipulator** | User prompt | Presents task and current text |
+
+### Data Flow
+
+**Input to TextManipulatorAgent:**
+- `instruction`: User's overall goal
+- `current_subgoal`: The TEXT_TASK description
+- `current_text`: Current content of focused text field (ORIGINAL variable)
+- `overall_plan`: Manager's full plan for context
+- `llm`: LLM instance for code generation
+- `max_retries`: Maximum retry attempts (default: 4)
+
+**LLM generates:**
+```python
+new_text = """Hello World
+""" + ORIGINAL
+input_text(new_text)
+```
+
+**Sandbox execution:**
+- Restricted environment (no imports, no builtins)
+- Only `input_text()` function and `ORIGINAL` variable available
+- Executes code safely
+- Captures final text from `input_text()` call
+
+**Output from TextManipulatorAgent:**
+- `text_to_type`: Final text to input (e.g., "Hello World\nThis is existing text")
+- `code_ran`: The generated Python code
+
+### Error Correction Flow
+
+**Attempt 1 - Code with error:**
+```python
+new_text = "Hello World" + ORIGINAL  # Missing newline
+input_text(new_text)
+```
+
+**Execution succeeds but may not be what user wants**
+
+**Attempt 2 - Corrected code:**
+```python
+new_text = "Hello World\n" + ORIGINAL  # Correct with newline
+input_text(new_text)
+```
+
+**If code has syntax error:**
+```python
+new_text = "Hello World + ORIGINAL  # Missing quote
+input_text(new_text)
+```
+
+**Error:** `SyntaxError: EOL while scanning string literal`
+
+**Error correction prompt sent to LLM:**
+```
+You are CODEACT_TEXT_AGENT, correcting your previous code that had execution errors.
+
+The code you generated previously failed with this error:
+SyntaxError: EOL while scanning string literal
+
+Please fix the code...
+```
+
+**LLM generates corrected code:**
+```python
+new_text = "Hello World\n" + ORIGINAL
+input_text(new_text)
+```
+
+### Constraints and Security
+
+**Allowed:**
+- Reference `ORIGINAL` variable
+- Call `input_text(text)` function
+- String operations and concatenation
+- Triple-quoted strings for multi-line text
+
+**NOT Allowed:**
+- `import` statements
+- Function/class definitions
+- `print()` or `input()` calls
+- File/network/system access
+- Any builtins
+
+### Example Flows
+
+**Example 1: Add signature**
+
+**Current text:** `"Meeting at 3pm tomorrow"`
+
+**Task:** `TEXT_TASK: Add my email signature at the end`
+
+**Generated code:**
+```python
+signature = "\n\nBest regards,\nJohn Doe\njohn@example.com"
+new_text = ORIGINAL + signature
+input_text(new_text)
+```
+
+**Result:** `"Meeting at 3pm tomorrow\n\nBest regards,\nJohn Doe\njohn@example.com"`
+
+---
+
+**Example 2: Replace text**
+
+**Current text:** `"The quick brown fox"`
+
+**Task:** `TEXT_TASK: Replace "brown" with "red"`
+
+**Generated code:**
+```python
+new_text = ORIGINAL.replace("brown", "red")
+input_text(new_text)
+```
+
+**Result:** `"The quick red fox"`
+
+---
+
+**Example 3: Format as bullet points**
+
+**Current text:** `"Item 1, Item 2, Item 3"`
+
+**Task:** `TEXT_TASK: Convert to bullet points`
+
+**Generated code:**
+```python
+items = ORIGINAL.split(", ")
+bullet_list = "\n".join([f"• {item}" for item in items])
+new_text = bullet_list
+input_text(new_text)
+```
+
+**Result:**
+```
+• Item 1
+• Item 2
+• Item 3
+```
+
+---
+
+## Structured Output Pipeline
+
+**When:** `output_model` is provided (Pydantic BaseModel for structured extraction)
+
+**Purpose:** Extract structured data from the final answer and return it in a typed format.
+
+### Pipeline Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Agent completes task                          │
+│          (CodeActAgent or ManagerAgent)                         │
+│                                                                 │
+│  Final answer: "The weather in London is 22°C and sunny"       │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ FinalizeEvent(result)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    DroidAgent Finalize                          │
+│                                                                 │
+│  If output_model is defined:                                   │
+│  → Route to StructuredOutputAgent                              │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ (final_answer, output_model)
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  StructuredOutputAgent                          │
+│                                                                 │
+│  Prompt Template:                                              │
+│  "Extract the following information from the text:             │
+│   {output_schema}                                              │
+│   Text: {final_answer}                                         │
+│   Return JSON matching the schema."                            │
+│                                                                 │
+│  LLM extracts structured data:                                 │
+│  {                                                             │
+│    "temperature": 22,                                          │
+│    "unit": "celsius",                                          │
+│    "condition": "sunny",                                       │
+│    "location": "London"                                        │
+│  }                                                             │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ Parsed Pydantic model instance
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        DroidAgent                               │
+│                                                                 │
+│  Returns ResultEvent with:                                     │
+│  - success: True                                               │
+│  - result: "The weather in London is 22°C and sunny"           │
+│  - data: WeatherInfo(                                          │
+│            temperature=22,                                     │
+│            unit="celsius",                                     │
+│            condition="sunny",                                  │
+│            location="London"                                   │
+│          )                                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+| Agent | Prompt | Purpose |
+|-------|--------|---------|
+| **StructuredOutputAgent** | Dynamic prompt template | Extracts structured data based on Pydantic schema |
+
+### Example
+
+**User code:**
+```python
+from pydantic import BaseModel
+
+class WeatherInfo(BaseModel):
+    temperature: int
+    unit: str
+    condition: str
+    location: str
+
+agent = DroidAgent(
+    goal="Check the weather in London",
+    output_model=WeatherInfo,
+    ...
+)
+```
+
+**Agent completes task:**
+- Final answer: "The current weather in London is 22 degrees Celsius and sunny."
+
+**StructuredOutputAgent extracts:**
+```python
+WeatherInfo(
+    temperature=22,
+    unit="celsius",
+    condition="sunny",
+    location="London"
+)
+```
+
+**User receives:**
+```python
+result = await agent.run()
+print(result.success)  # True
+print(result.result)   # "The current weather in London is 22 degrees Celsius and sunny."
+print(result.data)     # WeatherInfo(temperature=22, unit="celsius", condition="sunny", location="London")
+```
+
+---
+
+## Summary
+
+This document has covered all agent pipelines in DroidRun:
+
+1. **Direct Execution (CodeAct)**: Fast, single-agent code execution
+2. **Reasoning Mode (Manager-Executor)**: Strategic planning with atomic actions
+3. **Scripter Delegation**: Off-device Python operations
+4. **Text Manipulation**: Constrained code generation for text editing
+5. **Structured Output**: Typed data extraction from results
+
+Each pipeline is optimized for specific use cases, working together to provide a flexible and powerful Android automation system.
